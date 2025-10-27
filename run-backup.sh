@@ -4,18 +4,26 @@ set -euo pipefail
 
 # Neo4j Backup Script
 # This script runs the Neo4j backup utility in a Docker container
+# Usage: ./run-backup.sh [config_file]
+#   config_file: Path to backup configuration file (default: ./backup.env)
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/backup.env"
+CONFIG_FILE="${1:-${SCRIPT_DIR}/backup.env}"
+
+# Resolve to absolute path if relative path is provided
+if [[ ! "$CONFIG_FILE" = /* ]]; then
+    CONFIG_FILE="${SCRIPT_DIR}/${CONFIG_FILE}"
+fi
 
 # Source the configuration file
 if [[ ! -f "${CONFIG_FILE}" ]]; then
     echo "ERROR: Configuration file not found: ${CONFIG_FILE}"
-    echo "Please copy backup.env.example to backup.env and configure it."
+    echo "Usage: ./run-backup.sh [config_file]"
+    echo "Example: ./run-backup.sh backup.env.local"
     exit 1
 fi
 
@@ -28,10 +36,8 @@ source "${CONFIG_FILE}"
 
 # Required variables
 REQUIRED_VARS=(
-    "NEO4J_HOST"
+    "DATABASE_BACKUP_ENDPOINTS"
     "DATABASE_NAME"
-    "NEO4J_USER"
-    "NEO4J_PASSWORD"
 )
 
 for var in "${REQUIRED_VARS[@]}"; do
@@ -46,20 +52,12 @@ done
 # ============================================================================
 
 # Set defaults
-NEO4J_BACKUP_PORT="${NEO4J_BACKUP_PORT:-6362}"
 BACKUP_IMAGE="${BACKUP_IMAGE:-neo4j/helm-charts-backup:latest}"
 TEMP_BACKUP_DIR="${TEMP_BACKUP_DIR:-/tmp/neo4j-backup}"
 CONTAINER_NAME="${CONTAINER_NAME:-neo4j-backup-job}"
-FALLBACK_TO_FULL="${FALLBACK_TO_FULL:-true}"
-CHECK_CONSISTENCY="${CHECK_CONSISTENCY:-false}"
-CHECK_INDEXES="${CHECK_INDEXES:-false}"
-BACKUP_TIMEOUT="${BACKUP_TIMEOUT:-3600}"
 
 # Create temporary backup directory
 mkdir -p "${TEMP_BACKUP_DIR}"
-
-# Construct Neo4j address
-NEO4J_ADDR="${NEO4J_HOST}:${NEO4J_BACKUP_PORT}"
 
 # ============================================================================
 # Docker Environment Variables
@@ -67,14 +65,28 @@ NEO4J_ADDR="${NEO4J_HOST}:${NEO4J_BACKUP_PORT}"
 
 DOCKER_ENV_ARGS=(
     -e "DATABASE=${DATABASE_NAME}"
-    -e "NEO4J_ADDR=${NEO4J_ADDR}"
-    -e "NEO4J_USER=${NEO4J_USER}"
-    -e "NEO4J_PASSWORD=${NEO4J_PASSWORD}"
-    -e "FALLBACK_TO_FULL=${FALLBACK_TO_FULL}"
-    -e "CHECK_CONSISTENCY=${CHECK_CONSISTENCY}"
-    -e "CHECK_INDEXES=${CHECK_INDEXES}"
-    -e "NEO4J_server_config_strict__validation_enabled=false"
+    -e "DATABASE_BACKUP_ENDPOINTS=${DATABASE_BACKUP_ENDPOINTS}"
+    -e "INCLUDE_METADATA=${INCLUDE_METADATA:-all}"
+    -e "TYPE=${TYPE:-AUTO}"
+    -e "KEEP_FAILED=${KEEP_FAILED:-false}"
+    -e "COMPRESS=${COMPRESS:-true}"
+    -e "VERBOSE=${VERBOSE:-true}"
+    -e "PARALLEL_RECOVERY=${PARALLEL_RECOVERY:-false}"
+    -e "PREFER_DIFF_AS_PARENT=${PREFER_DIFF_AS_PARENT:-false}"
 )
+
+# Add optional parameters if set
+if [[ -n "${PAGE_CACHE:-}" ]]; then
+    DOCKER_ENV_ARGS+=(-e "PAGE_CACHE=${PAGE_CACHE}")
+fi
+
+if [[ -n "${HEAP_SIZE:-}" ]]; then
+    DOCKER_ENV_ARGS+=(-e "HEAP_SIZE=${HEAP_SIZE}")
+fi
+
+if [[ -n "${BACKUP_TEMP_DIR:-}" ]]; then
+    DOCKER_ENV_ARGS+=(-e "BACKUP_TEMP_DIR=${BACKUP_TEMP_DIR}")
+fi
 
 # Cloud provider configuration
 if [[ -n "${CLOUD_PROVIDER:-}" ]]; then
@@ -101,6 +113,12 @@ if [[ "${CLOUD_PROVIDER:-}" == "aws" ]]; then
     fi
     if [[ -n "${S3_SIGNATURE_VERSION:-}" ]]; then
         DOCKER_ENV_ARGS+=(-e "S3_SIGNATURE_VERSION=${S3_SIGNATURE_VERSION}")
+    fi
+    if [[ -n "${S3_CA_CERT_PATH:-}" ]]; then
+        DOCKER_ENV_ARGS+=(-e "S3_CA_CERT_PATH=${S3_CA_CERT_PATH}")
+    fi
+    if [[ -n "${S3_SKIP_VERIFY:-}" ]]; then
+        DOCKER_ENV_ARGS+=(-e "S3_SKIP_VERIFY=${S3_SKIP_VERIFY}")
     fi
 fi
 
@@ -139,7 +157,7 @@ log() {
 log "========================================"
 log "Neo4j Backup Starting"
 log "========================================"
-log "Neo4j Address: ${NEO4J_ADDR}"
+log "Backup Endpoints: ${DATABASE_BACKUP_ENDPOINTS}"
 log "Database(s): ${DATABASE_NAME}"
 log "Cloud Provider: ${CLOUD_PROVIDER:-local}"
 log "Bucket: ${BUCKET_NAME:-N/A}"
@@ -176,8 +194,9 @@ log "Starting backup container..."
 if docker run \
     --name "${CONTAINER_NAME}" \
     --rm \
+    --network "${DOCKER_NETWORK:-host}" \
     "${DOCKER_ENV_ARGS[@]}" \
-    -v "${TEMP_BACKUP_DIR}:/data:rw" \
+    -v "${TEMP_BACKUP_DIR}:/backups:rw" \
     "${BACKUP_IMAGE}" >> "${LOG_FILE}" 2>&1; then
 
     log "========================================"
